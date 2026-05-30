@@ -1,0 +1,88 @@
+:root {
+  --bg:        #060810;
+  --bg2:       #0b0e1a;
+  --panel:     #0f1420;
+  --panel2:    #141928;
+  --border:    rgba(255,255,255,0.06);
+  --border2:   rgba(99,179,237,0.25);
+  --text:      #e8eaf0;
+  --text2:     #8892a4;
+  --text3:     #454e60;
+  --accent:    #63b3ed;
+  --accent2:   #90cdf4;
+  --gold:      #f6ad55;
+  --green:     #68d391;
+  --red:       #fc8181;
+  --purple:    #b794f4;
+  --teal:      #4fd1c5;
+  --orange:    #f6ad55;
+  --mono:      'Space Mono', 'Fira Code', monospace;
+  --sans:      'Outfit', system-ui, sans-serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { height: 100%; }
+body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--text);
+  height: 100%;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+#root { height: 100%; display: flex; flex-direction: column; }
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(99,179,237,0.3); }
+
+a { color: var(--accent2); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* Animations */
+@keyframes spin        { to { transform: rotate(360deg); } }
+@keyframes fadeUp      { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+@keyframes fadeIn      { from { opacity:0; } to { opacity:1; } }
+@keyframes pulse       { 0%,100%{opacity:1;} 50%{opacity:.4;} }
+@keyframes slide       { 0%{left:-40%;} 100%{left:100%;} }
+@keyframes pulse-ring  { 0%{transform:scale(1);opacity:.6;} 100%{transform:scale(1.5);opacity:0;} }
+@keyframes scanline    { from{transform:translateY(-100%)} to{transform:translateY(100vh)} }
+@keyframes glowPulse   { 0%,100%{box-shadow:0 0 6px rgba(99,179,237,.3)} 50%{box-shadow:0 0 18px rgba(99,179,237,.6)} }
+@keyframes borderTrace {
+  0%   { background-position: 0% 0%; }
+  100% { background-position: 200% 0%; }
+}
+
+.fade-up  { animation: fadeUp  0.3s ease forwards; }
+.fade-in  { animation: fadeIn  0.2s ease forwards; }
+
+/* Scanline overlay */
+.scanline {
+  pointer-events: none;
+  position: fixed; inset: 0; z-index: 9999;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0px,
+    transparent 3px,
+    rgba(0,0,0,.04) 3px,
+    rgba(0,0,0,.04) 4px
+  );
+}
+
+/* Node type colors used both in graph and UI */
+.node-person     { --nc: #63b3ed; }
+.node-family     { --nc: #b794f4; }
+.node-party      { --nc: #f6ad55; }
+.node-university { --nc: #68d391; }
+.node-company    { --nc: #fc8181; }
+.node-govt       { --nc: #4fd1c5; }
+.node-org        { --nc: #76e4f7; }
+
+/* Glow text */
+.glow { text-shadow: 0 0 12px rgba(99,179,237,.6); }
+
+/* Score bar */
+.score-track { height:5px; border-radius:3px; background:rgba(255,255,255,0.06); overflow:hidden; }
+.score-fill  { height:100%; border-radius:3px; transition: width .5s ease; }
