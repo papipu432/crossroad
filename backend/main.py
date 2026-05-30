@@ -720,3 +720,520 @@ async def get_recent_changes(hours: int = Query(24, ge=1, le=168)):
         return {"changes": changes, "count": len(changes)}
     finally:
         await graph_db.close()
+
+
+# ── Business Registry Endpoints ───────────────────────────────────────────────
+
+@app.get("/api/business/person/{slug}/portfolio")
+async def get_person_business_portfolio(slug: str):
+    """
+    Get complete business portfolio for a politician.
+    Returns companies where they are shareholder, commissioner, or director.
+    """
+    from crawler.business_registry import BusinessRegistryIntegration
+    from db import get_person_by_slug
+    
+    # Get person details
+    person = await get_person_by_slug(slug)
+    if not person:
+        raise HTTPException(status_code=404, detail="Person not found")
+    
+    integration = BusinessRegistryIntegration()
+    try:
+        portfolio = await integration.get_person_business_portfolio(person['full_name'])
+        
+        # Also get from graph DB
+        companies = await _graph_db.get_person_companies(slug)
+        
+        # Detect conflicts
+        conflicts = await _graph_db.detect_business_conflicts(slug)
+        
+        return {
+            "person": person,
+            "portfolio": portfolio,
+            "graph_companies": companies,
+            "conflicts_detected": conflicts,
+            "total_companies": portfolio['total_companies'] + len(companies)
+        }
+    finally:
+        await integration.close_all()
+
+
+@app.get("/api/business/company/{npwb}")
+async def get_company_details(npwb: str):
+    """
+    Get company details and all associated politicians.
+    """
+    people = await _graph_db.get_company_people(npwb)
+    
+    if not people:
+        # Try to fetch from registry
+        from crawler.business_registry import AHUEnhancedCrawler
+        
+        crawler = AHUEnhancedCrawler()
+        try:
+            # Search by NPWB
+            companies = await crawler.search_company_by_name(npwb, exact=True)
+            if companies:
+                company = companies[0]
+                
+                # Store in graph
+                await _graph_db.upsert_company({
+                    "npwb": company.npwb,
+                    "name": company.name,
+                    "establishment_date": company.establishment_date,
+                    "capital_authorized": company.capital_authorized,
+                    "capital_paid": company.capital_paid,
+                    "status": company.status,
+                    "province": company.province,
+                    "city": company.city,
+                    "business_activities": company.business_activities,
+                    "source_url": company.source_url
+                })
+                
+                return {
+                    "company": {
+                        "name": company.name,
+                        "npwb": company.npwb,
+                        "establishment_date": company.establishment_date,
+                        "capital": company.capital_authorized,
+                        "status": company.status,
+                        "province": company.province,
+                        "shareholders": [
+                            {"name": s.name, "percent": s.shares_percent}
+                            for s in company.shareholders
+                        ],
+                        "commissioners": [
+                            {"name": c.name, "appointment_date": c.appointment_date}
+                            for c in company.commissioners
+                        ],
+                        "directors": [
+                            {"name": d.name, "appointment_date": d.appointment_date}
+                            for d in company.directors
+                        ]
+                    },
+                    "people": []
+                }
+        finally:
+            await crawler.close()
+        
+        raise HTTPException(status_code=404, detail="Company not found")
+    
+    return {"company_npwb": npwb, "associated_people": people}
+
+
+@app.post("/api/business/scan/{slug}")
+async def scan_person_business_connections(slug: str, background_tasks: BackgroundTasks):
+    """
+    Trigger a background scan of business connections for a person.
+    Stores results in graph database.
+    """
+    from crawler.business_registry import BusinessRegistryIntegration
+    from db import get_person_by_slug
+    
+    person = await get_person_by_slug(slug)
+    if not person:
+        raise HTTPException(status_code=404, detail="Person not found")
+    
+    async def scan_task():
+        integration = BusinessRegistryIntegration()
+        try:
+            portfolio = await integration.get_person_business_portfolio(person['full_name'])
+            
+            # Store companies in graph
+            for company_data in portfolio.get('private_companies', []):
+                await _graph_db.upsert_company(company_data)
+                
+                # Link person to company
+                if portfolio.get('as_shareholder'):
+                    for share in portfolio['as_shareholder']:
+                        if share['company'] == company_data['name']:
+                            await _graph_db.link_person_company(
+                                slug, 
+                                company_data.get('npwb', ''),
+                                'shareholder',
+                                {
+                                    'shares_percent': share.get('shares_percent'),
+                                    'shares_value': share.get('shares_value')
+                                }
+                            )
+                
+                if portfolio.get('as_commissioner'):
+                    for comm in portfolio['as_commissioner']:
+                        if comm['company'] == company_data['name']:
+                            await _graph_db.link_person_company(
+                                slug,
+                                company_data.get('npwb', ''),
+                                'commissioner',
+                                {'appointment_date': comm.get('appointment_date')}
+                            )
+                
+                if portfolio.get('as_director'):
+                    for director in portfolio['as_director']:
+                        if director['company'] == company_data['name']:
+                            await _graph_db.link_person_company(
+                                slug,
+                                company_data.get('npwb', ''),
+                                'director',
+                                {'appointment_date': director.get('appointment_date')}
+                            )
+            
+            logger.info(f"Business scan completed for {slug}: {portfolio['total_companies']} companies found")
+            
+        except Exception as e:
+            logger.error(f"Business scan error for {slug}: {e}")
+        finally:
+            await integration.close_all()
+    
+    background_tasks.add_task(scan_task)
+    
+    return {
+        "status": "scanning",
+        "message": f"Background scan started for {person['full_name']}",
+        "person_slug": slug
+    }
+
+
+@app.get("/api/business/conflicts/detect")
+async def detect_all_conflicts():
+    """
+    Detect conflicts of interest for all politicians in the database.
+    Returns list of flagged individuals.
+    """
+    from db import execute_query
+    
+    query = """
+    SELECT p.slug, p.full_name, p.position, p.party
+    FROM persons p
+    WHERE p.position IS NOT NULL
+    AND (p.position LIKE '%Menteri%' OR p.position LIKE '%Gubernur%' 
+         OR p.position LIKE '%Anggota Komisi%' OR p.position LIKE '%DPR%')
+    """
+    
+    results = await execute_query(query)
+    
+    all_conflicts = []
+    
+    for person in results:
+        conflicts = await _graph_db.detect_business_conflicts(person['slug'])
+        if conflicts:
+            all_conflicts.append({
+                "person": person,
+                "conflicts": conflicts,
+                "severity": max([c.get('severity', 'low') for c in conflicts], key=lambda x: {'high': 3, 'medium': 2, 'low': 1}.get(x, 0))
+            })
+    
+    # Sort by severity
+    severity_order = {'high': 0, 'medium': 1, 'low': 2}
+    all_conflicts.sort(key=lambda x: severity_order.get(x['severity'], 3))
+    
+    return {
+        "total_flagged": len(all_conflicts),
+        "conflicts": all_conflicts
+    }
+
+
+@app.get("/api/business/sectors/{sector}")
+async def get_companies_by_sector(sector: str):
+    """
+    Get all companies in a specific sector and their political connections.
+    """
+    from neo4j.exceptions import CypherSyntaxError
+    
+    try:
+        q = """
+        MATCH (c:Company)
+        WHERE ANY(activity IN c.business_activities WHERE toLower(activity) CONTAINS toLower($sector))
+        OPTIONAL MATCH (p:Person)-[r]->(c)
+        RETURN c, collect(DISTINCT p) AS politicians, collect(DISTINCT r) AS relationships
+        """
+        
+        results = []
+        async with _graph_db.driver.session() as s:
+            cursor = await s.run(q, {"sector": sector})
+            async for record in cursor:
+                company = dict(record["c"])
+                politicians = [dict(p) for p in record["politicians"] if p]
+                relationships = [dict(r) for r in record["relationships"] if r]
+                
+                results.append({
+                    "company": company,
+                    "politicians": politicians,
+                    "relationships": relationships
+                })
+        
+        return {"sector": sector, "companies": results, "count": len(results)}
+        
+    except Exception as e:
+        logger.error(f"Sector query error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# 🔍 MAS'UD DYNASTY & OLIGARCHY DETECTION API
+# ============================================================================
+
+@app.get("/api/oligarchy/masud-dynasty")
+async def scan_masud_dynasty():
+    """
+    Comprehensive investigation of the Mas'ud Dynasty in East Kalimantan.
+    
+    Detects:
+    - Family members in government positions
+    - Business ownership networks
+    - Self-dealing schemes (politician → company → government contract)
+    - Monopoly patterns (like "Harum Resort" exclusive mandates)
+    - Oligarchy score with risk assessment
+    
+    Returns detailed report with warning flags and evidence.
+    """
+    from tests.test_masud_dynasty import MasudDynastyDetector
+    
+    detector = MasudDynastyDetector(_graph_db, db)
+    
+    try:
+        score = await detector.scan_masud_dynasty()
+        
+        # Convert dataclasses to dicts for JSON response
+        schemes_list = []
+        for scheme in score.detected_schemes:
+            schemes_list.append({
+                "politician_name": scheme.politician_name,
+                "politician_position": scheme.politician_position,
+                "company_name": scheme.company_name,
+                "company_npwb": scheme.company_npwb,
+                "relationship_type": scheme.relationship_type,
+                "government_contract_type": scheme.government_contract_type,
+                "contract_value": scheme.contract_value,
+                "is_exclusive": scheme.is_exclusive,
+                "confidence_score": scheme.confidence_score,
+                "evidence_urls": scheme.evidence_urls,
+                "detection_date": scheme.detection_date,
+            })
+        
+        return {
+            "investigation_status": "complete",
+            "family_name": score.family_name,
+            "risk_level": score.risk_level,
+            "total_score": score.total_score,
+            "component_scores": {
+                "wealth_concentration": score.wealth_concentration,
+                "political_power": score.political_power,
+                "business_density": score.business_density,
+                "conflict_severity": score.conflict_severity,
+                "monopoly_control": score.monopoly_control,
+            },
+            "statistics": {
+                "total_companies": score.total_companies,
+                "government_positions": score.total_government_positions,
+                "self_dealing_schemes": len(score.detected_schemes),
+            },
+            "warning_flags": score.warning_flags,
+            "detected_schemes": schemes_list,
+        }
+        
+    except Exception as e:
+        logger.error(f"Mas'ud dynasty scan error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/oligarchy/{person_slug}/score")
+async def get_oligarchy_score(person_slug: str):
+    """
+    Get oligarchy score for a specific person.
+    
+    Analyzes:
+    - Number of companies owned
+    - Government position held
+    - Conflict of interest severity
+    - Family political network
+    """
+    from intelligence.dynasties import DynastyDetector
+    from tests.test_masud_dynasty import MasudDynastyDetector
+    
+    detector = MasudDynastyDetector(_graph_db, db)
+    
+    # Get person info
+    person = await db.get_person(person_slug)
+    if not person:
+        raise HTTPException(status_code=404, detail="Person not found")
+    
+    # Check if person is part of any dynasty
+    dynasty_detector = DynastyDetector(_graph_db, db)
+    dynasty_info = await dynasty_detector.detect_for_person(person_slug)
+    
+    # Get business holdings
+    try:
+        companies = await _graph_db.get_person_companies(person_slug)
+    except Exception:
+        companies = []
+    
+    # Get conflicts
+    try:
+        conflicts = await _graph_db.detect_business_conflicts(person_slug)
+    except Exception:
+        conflicts = []
+    
+    # Calculate simple oligarchy indicators
+    indicators = {
+        "has_government_position": bool(person.get("position")),
+        "owns_companies": len(companies) > 0,
+        "company_count": len(companies),
+        "has_conflicts": len(conflicts) > 0,
+        "conflict_count": len(conflicts),
+        "is_dynasty_member": dynasty_info is not None,
+        "dynasty_score": dynasty_info.get("dynasty_score") if dynasty_info else None,
+    }
+    
+    # Simple risk calculation
+    risk_score = 0.0
+    if indicators["has_government_position"]:
+        risk_score += 0.3
+    if indicators["owns_companies"]:
+        risk_score += min(indicators["company_count"] * 0.1, 0.3)
+    if indicators["has_conflicts"]:
+        risk_score += min(indicators["conflict_count"] * 0.15, 0.3)
+    if indicators["is_dynasty_member"]:
+        risk_score += 0.1
+    
+    risk_level = "LOW"
+    if risk_score >= 0.7:
+        risk_level = "CRITICAL"
+    elif risk_score >= 0.5:
+        risk_level = "HIGH"
+    elif risk_score >= 0.3:
+        risk_level = "MEDIUM"
+    
+    return {
+        "person": {
+            "slug": person_slug,
+            "name": person.get("full_name") or person.get("name"),
+            "position": person.get("position"),
+            "party": person.get("party"),
+            "province": person.get("province"),
+        },
+        "oligarchy_indicators": indicators,
+        "risk_score": round(risk_score, 2),
+        "risk_level": risk_level,
+        "dynasty_info": dynasty_info,
+        "companies": companies,
+        "conflicts": conflicts,
+    }
+
+
+@app.post("/api/oligarchy/scan-all")
+async def scan_all_oligarchs(background_tasks: BackgroundTasks):
+    """
+    Trigger background scan of all politicians for oligarchy patterns.
+    Returns task ID to check status later.
+    """
+    import uuid
+    from scheduler import OligarchyScanner
+    
+    task_id = str(uuid.uuid4())
+    
+    async def run_scan():
+        scanner = OligarchyScanner(_graph_db, db)
+        results = await scanner.scan_all_politicians()
+        # Cache results
+        await cache_set(f"oligarchy:scan:{task_id}", results, ttl=3600)
+    
+    background_tasks.add_task(run_scan)
+    
+    return {
+        "task_id": task_id,
+        "status": "started",
+        "message": "Oligarchy scan initiated. Check status via /api/oligarchy/scan-status/{task_id}"
+    }
+
+
+@app.get("/api/oligarchy/scan-status/{task_id}")
+async def get_scan_status(task_id: str):
+    """Get status of oligarchy scan task."""
+    result = await cache_get(f"oligarchy:scan:{task_id}")
+    
+    if result is None:
+        return {"task_id": task_id, "status": "pending", "message": "Scan still running or not found"}
+    
+    return {
+        "task_id": task_id,
+        "status": "complete",
+        "results": result
+    }
+
+
+@app.get("/api/self-dealing/detect-loops")
+async def detect_self_dealing_loops():
+    """
+    Detect self-dealing loops in the graph:
+    Politician → Owns Company → Wins Government Contract → Profits
+    
+    Returns all detected loops with confidence scores.
+    """
+    query = """
+    MATCH (p:Person)-[r1:OWNS_SHARES|COMMISSIONER_OF|DIRECTOR_OF|BENEFICIAL_OWNER_OF]->(c:Company)
+    WHERE r1.is_current = true
+    MATCH (c)-[r2:WON_CONTRACT]->(g:GovernmentContract)
+    OPTIONAL MATCH (p)-[:MEMBER_OF|WORKS_AT]->(agency:Org)
+    WHERE agency.name IN g.agency_name
+    RETURN p, c, g, r1, r2, agency
+    ORDER BY g.contract_value DESC
+    LIMIT 100
+    """
+    
+    loops = []
+    try:
+        async with _graph_db.driver.session() as session:
+            result = await session.run(query)
+            async for record in result:
+                person = dict(record["p"]) if record["p"] else {}
+                company = dict(record["c"]) if record["c"] else {}
+                contract = dict(record["g"]) if record["g"] else {}
+                ownership = dict(record["r1"]) if record["r1"] else {}
+                contract_rel = dict(record["r2"]) if record["r2"] else {}
+                agency = dict(record["agency"]) if record["agency"] else {}
+                
+                # Calculate conflict score
+                conflict_score = 0.7
+                if agency:
+                    conflict_score = 0.95  # Direct agency connection
+                
+                loops.append({
+                    "politician": {
+                        "name": person.get("name"),
+                        "position": person.get("position"),
+                        "party": person.get("party"),
+                    },
+                    "company": {
+                        "name": company.get("name"),
+                        "npwb": company.get("npwb"),
+                        "activities": company.get("business_activities"),
+                    },
+                    "contract": {
+                        "id": contract.get("contract_id"),
+                        "title": contract.get("title"),
+                        "value": contract.get("contract_value"),
+                        "agency": contract.get("agency_name") or agency.get("name"),
+                        "date": contract.get("award_date"),
+                    },
+                    "ownership_role": ownership.get("role_type"),
+                    "shares_percent": ownership.get("shares_percent"),
+                    "conflict_score": conflict_score,
+                    "is_self_dealing": conflict_score > 0.8,
+                })
+        
+        return {
+            "total_loops": len(loops),
+            "high_confidence": sum(1 for l in loops if l["conflict_score"] > 0.8),
+            "loops": loops
+        }
+        
+    except Exception as e:
+        logger.error(f"Self-dealing loop detection error: {e}")
+        # Return empty if no contracts in DB yet
+        return {
+            "total_loops": 0,
+            "high_confidence": 0,
+            "loops": [],
+            "note": "No government contract data available yet. Run LPSE crawler first."
+        }

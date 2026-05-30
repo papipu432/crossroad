@@ -543,6 +543,101 @@ class Scheduler:
 _scheduler: Optional[Scheduler] = None
 
 
+class OligarchyScanner:
+    """
+    Scanner for detecting oligarchy patterns across all politicians.
+    Used by the scheduled tasks and API endpoints.
+    """
+    
+    def __init__(self, graph_db, db):
+        self.graph = graph_db
+        self.db = db
+    
+    async def scan_all_politicians(self) -> Dict:
+        """
+        Scan all politicians for oligarchy patterns.
+        Returns comprehensive report.
+        """
+        from tests.test_masud_dynasty import MasudDynastyDetector
+        
+        logger.info("🔍 Starting oligarchy scan for all politicians...")
+        
+        # Get all persons with government positions
+        query = """
+        MATCH (p:Person)
+        WHERE p.role_type IN ['gubernur', 'bupati', 'walikota', 'dpr', 'dprd', 'menteri']
+        RETURN p.slug AS slug, p.name AS name, p.role_type AS role
+        """
+        
+        politicians = []
+        try:
+            async with self.graph.driver.session() as session:
+                result = await session.run(query)
+                async for record in result:
+                    politicians.append(dict(record))
+        except Exception as e:
+            logger.error(f"Error fetching politicians: {e}")
+            # Fallback to PostgreSQL
+            persons = await self.db.list_persons(limit=5000)
+            politicians = [
+                {"slug": p.get("slug"), "name": p.get("full_name"), "role": p.get("role_type")}
+                for p in persons
+                if p.get("role_type") in ['gubernur', 'bupati', 'walikota', 'dpr', 'dprd', 'menteri']
+            ]
+        
+        logger.info(f"Scanning {len(politicians)} politicians...")
+        
+        results = {
+            "scan_date": datetime.now(timezone.utc).isoformat(),
+            "total_scanned": len(politicians),
+            "high_risk": [],
+            "medium_risk": [],
+            "low_risk": [],
+            "summary": {},
+        }
+        
+        detector = MasudDynastyDetector(self.graph, self.db)
+        
+        for pol in politicians:
+            slug = pol.get("slug")
+            if not slug:
+                continue
+            
+            try:
+                score = await detector._calculate_oligarchy_score_for_person(slug)
+                
+                entry = {
+                    "slug": slug,
+                    "name": pol.get("name"),
+                    "role": pol.get("role"),
+                    "risk_score": score.get("total_score", 0),
+                    "risk_level": score.get("risk_level", "LOW"),
+                    "companies": score.get("company_count", 0),
+                    "conflicts": score.get("conflict_count", 0),
+                }
+                
+                if score.get("risk_level") == "CRITICAL" or score.get("total_score", 0) >= 0.7:
+                    results["high_risk"].append(entry)
+                elif score.get("risk_level") == "HIGH" or score.get("total_score", 0) >= 0.5:
+                    results["medium_risk"].append(entry)
+                else:
+                    results["low_risk"].append(entry)
+                    
+            except Exception as e:
+                logger.warning(f"Error scanning {slug}: {e}")
+        
+        results["summary"] = {
+            "high_risk_count": len(results["high_risk"]),
+            "medium_risk_count": len(results["medium_risk"]),
+            "low_risk_count": len(results["low_risk"]),
+            "critical_alerts": len([r for r in results["high_risk"] if r.get("risk_score", 0) >= 0.8]),
+        }
+        
+        logger.info(f"Oligarchy scan complete: {results['summary']}")
+        
+        return results
+
+
 async def start_scheduler():
     """Start background scheduler."""
     global _scheduler

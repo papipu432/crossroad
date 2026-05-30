@@ -479,3 +479,164 @@ class GraphDB:
                 "properties": properties or {}
             })
         logger.info(f"Created {rel_type} relationship: {from_slug} -> {to_slug}")
+    
+    # ── Company nodes ──────────────────────────────────────────────────────────
+    
+    async def upsert_company(self, company: Dict):
+        """Create or update a Company node."""
+        q = """
+        MERGE (c:Company {npwb: $npwb})
+        SET c.name              = $name,
+            c.establishment_date= $establishment_date,
+            c.capital_authorized= $capital_authorized,
+            c.capital_paid      = $capital_paid,
+            c.status            = $status,
+            c.province          = $province,
+            c.city              = $city,
+            c.business_activities= $business_activities,
+            c.source_url        = $source_url,
+            c.data_source       = $data_source,
+            c.updated_at        = timestamp()
+        """
+        async with self.driver.session() as s:
+            await s.run(q, {
+                "npwb": company.get("npwb", ""),
+                "name": company.get("name", ""),
+                "establishment_date": company.get("establishment_date", ""),
+                "capital_authorized": company.get("capital_authorized", 0),
+                "capital_paid": company.get("capital_paid", 0),
+                "status": company.get("status", "active"),
+                "province": company.get("province", ""),
+                "city": company.get("city", ""),
+                "business_activities": company.get("business_activities", []),
+                "source_url": company.get("source_url", ""),
+                "data_source": company.get("data_source", "AHU")
+            })
+        logger.info(f"Upserted company: {company.get('name')} ({company.get('npwb')})")
+    
+    async def link_person_company(self, person_slug: str, company_npwb: str, 
+                                   role_type: str, properties: Dict = None):
+        """
+        Link a person to a company with a specific role.
+        role_type: SHAREHOLDER, COMMISSIONER, DIRECTOR, BENEFICIAL_OWNER
+        """
+        role_map = {
+            'shareholder': 'OWNS_SHARES',
+            'commissioner': 'COMMISSIONER_OF',
+            'director': 'DIRECTOR_OF',
+            'beneficial_owner': 'BENEFICIAL_OWNER_OF'
+        }
+        
+        rel_type = role_map.get(role_type.lower(), 'AFFILIATED_WITH')
+        
+        q = f"""
+        MATCH (p:Person {{slug: $person_slug}})
+        MATCH (c:Company {{npwb: $company_npwb}})
+        MERGE (p)-[r:{rel_type}]->(c)
+        SET r += $properties,
+            r.role_type     = $role_type,
+            r.appointment_date = $appointment_date,
+            r.shares_percent   = $shares_percent,
+            r.shares_value     = $shares_value,
+            r.is_current       = $is_current,
+            r.updated_at       = timestamp()
+        """
+        
+        props = properties or {}
+        async with self.driver.session() as s:
+            await s.run(q, {
+                "person_slug": person_slug,
+                "company_npwb": company_npwb,
+                "role_type": role_type,
+                "appointment_date": props.get("appointment_date"),
+                "shares_percent": props.get("shares_percent"),
+                "shares_value": props.get("shares_value"),
+                "is_current": props.get("is_current", True)
+            })
+        
+        logger.info(f"Linked {person_slug} as {role_type} to company {company_npwb}")
+    
+    async def get_person_companies(self, person_slug: str) -> List[Dict]:
+        """Get all companies associated with a person."""
+        q = """
+        MATCH (p:Person {slug: $slug})-[r]-(c:Company)
+        RETURN c, r
+        """
+        results = []
+        async with self.driver.session() as s:
+            cursor = await s.run(q, {"slug": person_slug})
+            async for record in cursor:
+                company = dict(record["c"])
+                rel = dict(record["r"]) if record["r"] else {}
+                results.append({
+                    "company": company,
+                    "relationship": rel
+                })
+        return results
+    
+    async def get_company_people(self, company_npwb: str) -> List[Dict]:
+        """Get all people associated with a company."""
+        q = """
+        MATCH (p:Person)-[r]-(c:Company {npwb: $npwb})
+        RETURN p, r
+        """
+        results = []
+        async with self.driver.session() as s:
+            cursor = await s.run(q, {"npwb": company_npwb})
+            async for record in cursor:
+                person = dict(record["p"])
+                rel = dict(record["r"]) if record["r"] else {}
+                results.append({
+                    "person": person,
+                    "relationship": rel
+                })
+        return results
+    
+    async def detect_business_conflicts(self, person_slug: str) -> List[Dict]:
+        """
+        Detect potential conflicts of interest based on business holdings.
+        Returns list of flagged relationships.
+        """
+        conflicts = []
+        
+        q = """
+        MATCH (p:Person {slug: $slug})-[r:OWNS_SHARES|COMMISSIONER_OF|DIRECTOR_OF|BENEFICIAL_OWNER_OF]->(c:Company)
+        WHERE r.is_current = true
+        RETURN p, r, c
+        """
+        
+        # Position-sector conflict mapping
+        conflict_sectors = {
+            'Menteri ESDM': ['Pertambangan', 'Energi', 'Minyak dan Gas'],
+            'Menteri Perhubungan': ['Transportasi', 'Logistik'],
+            'Gubernur': ['Konstruksi', 'Pengembangan Properti'],
+            'Anggota Komisi VI': ['Manufaktur', 'Industri']
+        }
+        
+        async with self.driver.session() as s:
+            cursor = await s.run(q, {"slug": person_slug})
+            async for record in cursor:
+                person = dict(record["p"])
+                company = dict(record["c"])
+                rel = dict(record["r"])
+                
+                position = person.get("position", "")
+                activities = company.get("business_activities", [])
+                
+                # Check for conflicts
+                for pos_pattern, sectors in conflict_sectors.items():
+                    if pos_pattern.lower() in position.lower():
+                        for activity in activities:
+                            for sector in sectors:
+                                if sector.lower() in activity.lower():
+                                    conflicts.append({
+                                        "person": person.get("name"),
+                                        "position": position,
+                                        "company": company.get("name"),
+                                        "sector": sector,
+                                        "activity": activity,
+                                        "role": rel.get("role_type"),
+                                        "severity": "high" if "Menteri" in position else "medium"
+                                    })
+        
+        return conflicts
