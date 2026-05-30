@@ -402,6 +402,13 @@ async def list_jobs():
 async def startup():
     await _graph_db.init_schema()
     logger.info("🇮🇩 Crossroad v2 started — Autonomous Knowledge Graph ready")
+    
+    # Start scheduler if enabled
+    if os.getenv("ENABLE_SCHEDULER", "false").lower() == "true":
+        from scheduler import start_scheduler
+        asyncio.create_task(start_scheduler())
+        logger.info("🕐 Scheduler enabled — daily updates active")
+    
     # Auto-start if configured
     if os.getenv("AUTO_START_CRAWLER","false").lower() == "true":
         logger.info("AUTO_START_CRAWLER=true — starting master agent…")
@@ -592,3 +599,124 @@ async def cross_coalition_links():
     links  = await viewer.find_cross_coalition_links()
     await cache_set(ck, links, 60 * 15)
     return {"source": "live", "links": links}
+
+
+# ── Enhanced Data Sources API ───────────────────────────────────────────────
+
+@app.get("/api/enhanced/person/{slug}/dossier")
+async def get_person_dossier(slug: str):
+    """
+    Get comprehensive intelligence dossier for a person.
+    Includes: assets, KPK cases, business interests, risk score.
+    """
+    from crawler.enhanced_sources import IntegratedDataSource
+    
+    person = await db.get_person(slug)
+    if not person:
+        raise HTTPException(404, "Person not found")
+    
+    source = IntegratedDataSource()
+    try:
+        dossier = await source.enrich_person(
+            slug,
+            person.get("full_name", ""),
+            person.get("current_position", "")
+        )
+        return {"source": "live", **dossier}
+    finally:
+        await source.close_all()
+
+
+@app.get("/api/enhanced/kpu/candidates")
+async def get_kpu_candidates(level: str = Query("nasional")):
+    """Get election candidates from KPU."""
+    from crawler.enhanced_sources import crawl_kpu_candidates
+    
+    candidates = await crawl_kpu_candidates(level)
+    return {"candidates": candidates, "count": len(candidates)}
+
+
+@app.get("/api/enhanced/lhkpn/{name}")
+async def search_lhkpn(name: str):
+    """Search asset declarations by name."""
+    from crawler.enhanced_sources import crawl_lhkpn_assets
+    
+    declarations = await crawl_lhkpn_assets(name)
+    return {
+        "declarations": [
+            {
+                "name": d.name,
+                "position": d.position,
+                "report_date": d.report_date,
+                "total_assets": d.total_assets,
+                "net_worth": d.total_assets - d.liabilities,
+                "source_url": d.source_url
+            }
+            for d in declarations
+        ],
+        "count": len(declarations)
+    }
+
+
+@app.get("/api/enhanced/kpk/search")
+async def search_kpk(q: str = Query(..., min_length=2)):
+    """Search KPK corruption cases."""
+    from crawler.enhanced_sources import crawl_kpk_cases
+    
+    cases = await crawl_kpk_cases(q)
+    return {
+        "cases": [
+            {
+                "title": c.title,
+                "status": c.status,
+                "category": c.category,
+                "loss_amount": c.loss_amount,
+                "source_url": c.source_url
+            }
+            for c in cases
+        ],
+        "count": len(cases)
+    }
+
+
+@app.get("/api/scheduler/status")
+async def scheduler_status():
+    """Get scheduler status and upcoming tasks."""
+    from scheduler import get_scheduler
+    
+    scheduler = get_scheduler()
+    if not scheduler:
+        return {"enabled": False, "message": "Scheduler not running"}
+    
+    return {
+        "enabled": True,
+        "running": scheduler.running,
+        "tasks": [
+            {
+                "name": t.name,
+                "type": t.schedule_type.value,
+                "interval_hours": t.interval_hours,
+                "last_run": t.last_run.isoformat() if t.last_run else None,
+                "next_run": t.next_run.isoformat() if t.next_run else None,
+                "enabled": t.enabled,
+                "errors": t.errors
+            }
+            for t in scheduler.tasks.values()
+        ]
+    }
+
+
+@app.get("/api/changes/recent")
+async def get_recent_changes(hours: int = Query(24, ge=1, le=168)):
+    """Get recent changes from audit log."""
+    from scheduler import DynamicUpdater, GraphDB, LLMEnricher
+    
+    graph_db = GraphDB()
+    llm = LLMEnricher()
+    updater = DynamicUpdater(graph_db, llm)
+    
+    try:
+        changes = await updater.get_recent_changes(hours)
+        return {"changes": changes, "count": len(changes)}
+    finally:
+        await graph_db.close()

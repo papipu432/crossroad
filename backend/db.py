@@ -363,3 +363,25 @@ async def truncate_crawl_data():
             await conn.execute("DELETE FROM organisations")
             await conn.execute("UPDATE crawl_jobs SET status='archived' WHERE status IN ('running','done','failed')")
     logger.info("Crawl data wiped for fresh restart")
+
+
+# ── Updates for Scheduler ──────────────────────────────────────────────────────
+
+async def update_person_position(slug: str, new_position: str, source: str):
+    """Update a person's position (for scheduler change detection)."""
+    db = await pool()
+    await db.execute(
+        "UPDATE persons SET current_position = $1, updated_at = NOW() WHERE slug = $2",
+        new_position, slug
+    )
+    logger.info(f"Updated position for {slug}: {new_position}")
+
+
+async def update_person_party(slug: str, new_party: str, source: str):
+    """Update a person's party affiliation (for scheduler change detection)."""
+    db = await pool()
+    await db.execute(
+        "UPDATE persons SET party = $1, updated_at = NOW() WHERE slug = $2",
+        new_party, slug
+    )
+    logger.info(f"Updated party for {slug}: {new_party}")

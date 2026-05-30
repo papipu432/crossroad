@@ -438,3 +438,44 @@ class GraphDB:
         async with self.driver.session() as s:
             await s.run(q)
         logger.info("Neo4j graph cleared for fresh restart")
+    
+    # ── Scheduler update methods ──────────────────────────────────────────────
+    
+    async def update_person_position(self, slug: str, new_position: str):
+        """Update a person's position in Neo4j."""
+        q = """
+        MATCH (p:Person {slug: $slug})
+        SET p.position = $position, p.updated_at = datetime()
+        RETURN p.slug
+        """
+        async with self.driver.session() as s:
+            await s.run(q, {"slug": slug, "position": new_position})
+        logger.info(f"Neo4j updated position for {slug}")
+    
+    async def update_person_party(self, slug: str, new_party: str):
+        """Update a person's party in Neo4j."""
+        q = """
+        MATCH (p:Person {slug: $slug})
+        SET p.party = $party, p.updated_at = datetime()
+        RETURN p.slug
+        """
+        async with self.driver.session() as s:
+            await s.run(q, {"slug": slug, "party": new_party})
+        logger.info(f"Neo4j updated party for {slug}")
+    
+    async def create_relationship(self, from_slug: str, to_slug: str, rel_type: str, properties: Dict = None):
+        """Create a relationship between two persons/entities."""
+        q = f"""
+        MATCH (a:Person {{slug: $from_slug}})
+        MATCH (b:Person {{slug: $to_slug}})
+        MERGE (a)-[r:{rel_type}]->(b)
+        SET r += $properties, r.created_at = datetime()
+        RETURN type(r) AS rel
+        """
+        async with self.driver.session() as s:
+            await s.run(q, {
+                "from_slug": from_slug,
+                "to_slug": to_slug,
+                "properties": properties or {}
+            })
+        logger.info(f"Created {rel_type} relationship: {from_slug} -> {to_slug}")
